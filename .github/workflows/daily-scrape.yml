@@ -1,0 +1,62 @@
+name: Daily Davril Supply Scrape
+
+on:
+  # Run daily at midnight UTC
+  schedule:
+    - cron: '0 0 * * *'
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      test_run:
+        description: 'Run in test mode (only scrape one category)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run scraper
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      run: |
+        if [ "${{ github.event.inputs.test_run }}" = "true" ]; then
+          echo "Running in test mode..."
+          python test_scraper.py
+        else
+          echo "Running full scraper..."
+          python run_full_scraper.py
+        fi
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: scraper-logs
+        path: |
+          *.log
+          scraper.log
