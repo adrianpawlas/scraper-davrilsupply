@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import base64
 import hashlib
 import requests
 from selenium import webdriver
@@ -304,6 +305,55 @@ class DavrilSupplyScraper:
         logger.info(f"Total unique products extracted: {len(unique_products)}")
         return unique_products
 
+    # 1x1 transparent PNG used as lazy-load placeholder on many sites (incl. Shopify)
+    _PLACEHOLDER_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVQYV2NgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
+
+    def _is_valid_image_url(self, url: Optional[str]) -> bool:
+        """Return False for data: URLs, placeholders, or non-http(s)."""
+        if not url or not isinstance(url, str):
+            return False
+        u = url.strip()
+        if u.lower().startswith("data:"):
+            return False
+        if "data:image" in u.lower():
+            return False
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return False
+        return True
+
+    def _parse_srcset_first_url(self, srcset: str) -> Optional[str]:
+        """Parse srcset 'url1 1x, url2 2x' and return first URL."""
+        if not srcset or not isinstance(srcset, str):
+            return None
+        part = srcset.strip().split(",")[0].strip().split()
+        return part[0] if part else None
+
+    def _get_best_image_src(self, img, base_url: str) -> Optional[str]:
+        """
+        Get best HTTP(S) image URL from an img element. Prefer lazy-load attrs
+        (data-src, data-srcset, srcset) over src to avoid 1x1 placeholder.
+        """
+        if not img:
+            return None
+        candidates = []
+        # Prefer lazy-load attributes over src
+        for attr in ("data-src", "data-srcset", "srcset", "data-lazy-src", "data-original", "src"):
+            val = img.get(attr)
+            if not val:
+                continue
+            if attr in ("data-srcset", "srcset"):
+                u = self._parse_srcset_first_url(val)
+                if u:
+                    candidates.append(u)
+            else:
+                candidates.append(val)
+        for c in candidates:
+            if self._is_valid_image_url(c):
+                if not c.startswith("http"):
+                    return urljoin(base_url, c)
+                return c
+        return None
+
     def extract_product_from_link(self, link, category_url: str, soup) -> dict:
         """Extract product data from a product link element"""
         try:
@@ -428,138 +478,87 @@ class DavrilSupplyScraper:
                 logger.warning(f"Could not parse price: {price_text}")
                 return None
 
-            # Find image - comprehensive search for product images
+            # Find image - use _get_best_image_src to avoid data: placeholders; prefer data-src/srcset
             image_url = None
-
-            # Method 1: Look for img tag within the product container and nearby elements
             container = link.parent
+
+            # Method 1: img within product container
             img = container.find('img')
             if img:
-                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or img.get('data-original')
-                if src:
-                    if not src.startswith('http'):
-                        image_url = urljoin(self.base_url, src)
-                    else:
-                        image_url = src
+                image_url = self._get_best_image_src(img, self.base_url)
 
-            # Method 2: If not found, look in parent containers (up to 3 levels)
+            # Method 2: parent containers (up to 3 levels)
             if not image_url:
                 parent = container.parent
                 for _ in range(3):
                     if parent:
                         img = parent.find('img')
                         if img:
-                            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or img.get('data-original')
-                            if src and ('product' in src.lower() or 'image' in src.lower()):
-                                if not src.startswith('http'):
-                                    image_url = urljoin(self.base_url, src)
-                                else:
-                                    image_url = src
+                            u = self._get_best_image_src(img, self.base_url)
+                            if u and ('product' in u.lower() or 'image' in u.lower()):
+                                image_url = u
                                 break
                     parent = parent.parent if parent else None
 
-            # Method 3: Look for images by alt text matching product title
+            # Method 3: match by alt text
             if not image_url:
                 title_lower = title.lower()
-                all_images = soup.find_all('img', {'src': True})
-                for img in all_images:
-                    alt_text = img.get('alt', '').lower()
-                    # Check if alt text contains product title words
-                    if any(word in alt_text for word in title_lower.split() if len(word) > 2):
-                        src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or img.get('data-original')
-                        if src and ('product' in src.lower() or 'http' in src):
-                            if not src.startswith('http'):
-                                image_url = urljoin(self.base_url, src)
-                            else:
-                                image_url = src
+                for img in soup.find_all('img'):
+                    alt_text = (img.get('alt') or '').lower()
+                    if any(w in alt_text for w in title_lower.split() if len(w) > 2):
+                        u = self._get_best_image_src(img, self.base_url)
+                        if u and ('product' in u.lower() or 'http' in u):
+                            image_url = u
                             break
 
-            # Method 4: Visit the product page to get the main product image
+            # Method 4: visit product page for main image
             if not image_url:
                 try:
                     logger.debug(f"Visiting product page for image: {product_url}")
                     product_html = self.get_page_content(product_url)
                     if product_html:
                         product_soup = BeautifulSoup(product_html, 'html.parser')
-
-                        # Look for main product image with various selectors
                         product_img = None
-
-                        # Try common product image selectors
-                        selectors = [
-                            'img[data-image]',
-                            'img.product-image',
-                            'img.main-image',
-                            '.product-image img',
-                            '.main-image img',
-                            '#product-image img',
-                            '.gallery img',
-                            '.product-gallery img'
-                        ]
-
-                        for selector in selectors:
-                            product_img = product_soup.select_one(selector)
+                        for sel in (
+                            'img[data-image]', 'img.product-image', 'img.main-image',
+                            '.product-image img', '.main-image img', '#product-image img',
+                            '.gallery img', '.product-gallery img'
+                        ):
+                            product_img = product_soup.select_one(sel)
                             if product_img:
                                 break
-
-                        # If not found, look for largest image on the page
                         if not product_img:
-                            all_imgs = product_soup.find_all('img')
-                            largest_img = None
-                            max_size = 0
-
-                            for img in all_imgs:
-                                src = img.get('src') or img.get('data-src')
-                                if src and ('product' in src.lower() or 'image' in src.lower()):
-                                    # Try to estimate image size from attributes
-                                    width = img.get('width') or img.get('data-width')
-                                    height = img.get('height') or img.get('data-height')
-
-                                    if width and height:
-                                        try:
-                                            size = int(width) * int(height)
-                                            if size > max_size:
-                                                max_size = size
-                                                largest_img = img
-                                        except:
-                                            pass
-
-                                    # If no size info, just take the first product-related image
-                                    if not largest_img and ('product' in src.lower()):
-                                        largest_img = img
-
-                            product_img = largest_img
-
+                            for img in product_soup.find_all('img'):
+                                u = self._get_best_image_src(img, self.base_url)
+                                if u and ('product' in u.lower() or 'image' in u.lower()):
+                                    product_img = img
+                                    break
                         if product_img:
-                            src = product_img.get('src') or product_img.get('data-src') or product_img.get('data-original')
-                            if src:
-                                if not src.startswith('http'):
-                                    image_url = urljoin(self.base_url, src)
-                                else:
-                                    image_url = src
+                            image_url = self._get_best_image_src(product_img, self.base_url)
+                            if image_url:
                                 logger.debug(f"Found product image: {image_url}")
-
                 except Exception as e:
                     logger.debug(f"Could not extract image from product page: {e}")
 
-            # If still no image found, try one more approach - look for images in the same row/section
+            # Method 5: product card / row
             if not image_url:
-                # Find the product card/section and look for images within it
                 product_card = link
-                for _ in range(5):  # Go up 5 levels max to find product card
-                    product_card = product_card.parent
-                    if product_card and product_card.get('class'):
-                        classes = ' '.join(product_card.get('class', []))
-                        if any(keyword in classes.lower() for keyword in ['product', 'card', 'item', 'grid-item']):
-                            img = product_card.find('img')
-                            if img:
-                                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-                                if src:
-                                    if not src.startswith('http'):
-                                        image_url = urljoin(self.base_url, src)
-                                    else:
-                                        image_url = src
-                                    break
+                for _ in range(5):
+                    product_card = product_card.parent if product_card else None
+                    if not product_card or not product_card.get('class'):
+                        continue
+                    classes = ' '.join(product_card.get('class', []))
+                    if not any(k in classes.lower() for k in ('product', 'card', 'item', 'grid-item')):
+                        continue
+                    img = product_card.find('img')
+                    if img:
+                        image_url = self._get_best_image_src(img, self.base_url)
+                    if image_url:
+                        break
+
+            if not image_url or not self._is_valid_image_url(image_url):
+                logger.warning(f"No valid image URL for product: {title}")
+                return None
 
             # Extract sizes if available (look for S, M, L, XL in the container)
             sizes = []
@@ -707,15 +706,10 @@ class DavrilSupplyScraper:
                 logger.warning(f"Could not parse price: {price_text}")
                 return None
 
-            # Extract image URL
+            # Extract image URL — use helper to avoid data: placeholders
             img_elem = container.find('img')
-            image_url = None
-            if img_elem:
-                image_url = img_elem.get('src') or img_elem.get('data-src')
-                if image_url and not image_url.startswith('http'):
-                    image_url = urljoin(self.base_url, image_url)
-
-            if not image_url:
+            image_url = self._get_best_image_src(img_elem, self.base_url) if img_elem else None
+            if not image_url or not self._is_valid_image_url(image_url):
                 return None
 
             # Extract product URL
@@ -772,29 +766,36 @@ class DavrilSupplyScraper:
         """Convert EUR price to USD"""
         return round(eur_price * self.eur_to_usd_rate, 2)
 
-    def generate_image_embedding(self, image_url: str) -> list:
-        """Generate 768-dim embedding from image URL"""
+    def generate_image_embedding(self, image_url: str) -> Optional[list]:
+        """Generate 768-dim embedding from image URL (http(s) or data:)."""
         try:
-            # Download image
-            response = requests.get(image_url, timeout=10)
-            response.raise_for_status()
+            raw: bytes
+            if image_url.strip().lower().startswith("data:"):
+                # data:image/png;base64,... — decode and load; skip placeholders
+                if self._PLACEHOLDER_B64 in image_url or "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" in image_url:
+                    logger.warning("Skipping embedding for 1x1 placeholder data URL")
+                    return None
+                idx = image_url.find("base64,")
+                if idx == -1:
+                    logger.warning("data: URL has no base64 payload")
+                    return None
+                raw = base64.b64decode(image_url[idx + 7 :].strip())
+            else:
+                if not self._is_valid_image_url(image_url):
+                    logger.warning(f"Invalid image URL for embedding: {image_url[:80]}...")
+                    return None
+                response = requests.get(image_url, timeout=10)
+                response.raise_for_status()
+                raw = response.content
 
-            # Open image
-            image = Image.open(io.BytesIO(response.content)).convert('RGB')
-
-            # Process image for the model
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
             inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-
             with torch.no_grad():
                 outputs = self.model(**inputs)
-
-            # Get the image embeddings (768-dim)
             embeddings = outputs.pooler_output.cpu().numpy().flatten().tolist()
-
             return embeddings
-
         except Exception as e:
-            logger.error(f"Error generating embedding for {image_url}: {e}")
+            logger.error(f"Error generating embedding for {image_url[:80]}...: {e}")
             return None
 
     def save_product_to_supabase(self, product_data: dict):
