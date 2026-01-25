@@ -186,31 +186,76 @@ class DavrilSupplyScraper:
             if not title or len(title) < 3:
                 return None
 
-            # Find the price - look in the link text and surrounding elements
+            # Find the price - comprehensive search in multiple locations
             price_text = None
             container = link.parent
 
-            # First, check the link text itself
-            link_text = link.get_text()
-            price_match = re.search(r'(\d+\.\d+,\d+)', link_text)
-            if price_match:
-                price_text = f"€{price_match.group(1).replace('.', '').replace(',', '.')}"
-            else:
-                # Look for price patterns like "1.113,00" in the text
-                price_match = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})', link_text)
-                if price_match:
-                    # Convert format like "1.113,00" to "1113,00"
-                    price_num = price_match.group(1).replace('.', '')
-                    price_text = f"€{price_num}"
+            # Method 1: Look in the entire container text for various price patterns
+            container_text = container.get_text()
 
-            # If not found in link text, look in siblings
+            # Look for European format prices like "1.113,00 €" or "1113,00€"
+            price_patterns = [
+                r'(\d{1,3}(?:\.\d{3})*,\d{2})\s*€?',  # 1.113,00 €
+                r'€\s*(\d{1,3}(?:\.\d{3})*,\d{2})',    # € 1.113,00
+                r'(\d{1,3}(?:\.\d{3})*,\d{2})',        # 1.113,00 (without €)
+                r'(\d+(?:,\d{2})?)',                    # Simple format like 1113,00
+            ]
+
+            for pattern in price_patterns:
+                match = re.search(pattern, container_text)
+                if match:
+                    price_str = match.group(1)
+                    # Convert European format to standard decimal
+                    if ',' in price_str and '.' in price_str:
+                        # Handle thousands separator: 1.113,00 -> 1113.00
+                        price_str = price_str.replace('.', '').replace(',', '.')
+                    elif ',' in price_str:
+                        # Handle decimal comma: 1113,00 -> 1113.00
+                        price_str = price_str.replace(',', '.')
+                    price_text = f"€{price_str}"
+                    break
+
+            # Method 2: If not found, look for price in data attributes
             if not price_text:
-                for sibling in container.find_next_siblings()[:3]:  # Check next 3 siblings
+                price_attr = container.get('data-price') or link.get('data-price')
+                if price_attr:
+                    try:
+                        # Convert to float and format as EUR
+                        price_val = float(price_attr.replace(',', '.'))
+                        price_text = f"€{price_val:.2f}"
+                    except ValueError:
+                        pass
+
+            # Method 3: Look for price in child elements with price classes
+            if not price_text:
+                price_elements = container.find_all(['span', 'div'], class_=re.compile(r'.*price.*', re.IGNORECASE))
+                for price_elem in price_elements:
+                    elem_text = price_elem.get_text().strip()
+                    match = re.search(r'(\d+(?:[.,]\d+)?)', elem_text)
+                    if match:
+                        price_str = match.group(1).replace(',', '.')
+                        try:
+                            price_val = float(price_str)
+                            price_text = f"€{price_val:.2f}"
+                            break
+                        except ValueError:
+                            continue
+
+            # Method 4: Look in siblings as fallback
+            if not price_text:
+                for sibling in container.find_next_siblings()[:5]:  # Check more siblings
                     sibling_text = sibling.get_text()
-                    price_match = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})', sibling_text)
-                    if price_match:
-                        price_num = price_match.group(1).replace('.', '')
-                        price_text = f"€{price_num}"
+                    for pattern in price_patterns:
+                        match = re.search(pattern, sibling_text)
+                        if match:
+                            price_str = match.group(1)
+                            if ',' in price_str and '.' in price_str:
+                                price_str = price_str.replace('.', '').replace(',', '.')
+                            elif ',' in price_str:
+                                price_str = price_str.replace(',', '.')
+                            price_text = f"€{price_str}"
+                            break
+                    if price_text:
                         break
 
             if not price_text:
