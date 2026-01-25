@@ -831,10 +831,12 @@ class DavrilSupplyScraper:
                 raw = response.content
 
             image = Image.open(io.BytesIO(raw)).convert("RGB")
-            inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+            # SigLIP requires both image and text inputs - provide dummy text for image-only embedding
+            inputs = self.processor(images=image, text=[""], return_tensors="pt").to(self.device)
             with torch.no_grad():
                 outputs = self.model(**inputs)
-            embeddings = outputs.pooler_output.cpu().numpy().flatten().tolist()
+            # Use vision embeddings for image representation
+            embeddings = outputs.vision_pooler_output.cpu().numpy().flatten().tolist()
             return embeddings
         except Exception as e:
             logger.error(f"Error generating embedding for {image_url[:80]}...: {e}")
