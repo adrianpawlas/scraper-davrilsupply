@@ -1,7 +1,7 @@
 import os
 import time
 import json
-import uuid
+import hashlib
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -11,7 +11,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
-from supabase import create_client, Client
 import torch
 from transformers import AutoProcessor, AutoModel
 from PIL import Image
@@ -21,22 +20,174 @@ from fake_useragent import UserAgent
 import cloudscraper
 from urllib.parse import urljoin, urlparse
 import re
+from typing import Dict, List, Any, Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+class SupabaseREST:
+    """
+    Minimal Supabase PostgREST helper for upserting into 'products' table.
+    Uses direct REST API calls to avoid Edge Function requirements.
+    """
+
+    def __init__(self, url: str, key: str):
+        self.base_url = url.rstrip("/")
+        self.key = key
+        self.session = requests.Session()
+        self.session.headers.update({
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+        })
+
+    def upsert_products(self, products: List[Dict[str, Any]]) -> bool:
+        """
+        Upsert products into the database.
+        Args:
+            products: List of product dictionaries
+        Returns:
+            True if successful, False otherwise
+        """
+        if not products:
+            return True
+
+        try:
+            # Format products for database
+            formatted_products = []
+            seen_ids = set()
+
+            for product in products:
+                formatted_product = self._format_product_for_db(product)
+                if formatted_product:
+                    # Deduplicate by id
+                    product_id = formatted_product.get('id')
+                    if product_id and product_id not in seen_ids:
+                        seen_ids.add(product_id)
+                        formatted_products.append(formatted_product)
+
+            if not formatted_products:
+                logger.warning("No valid products to upsert after formatting")
+                return False
+
+            logger.info(f"Upserting {len(formatted_products)} unique products")
+
+            # Normalize all products to have the same keys
+            all_keys = set()
+            for p in formatted_products:
+                all_keys.update(p.keys())
+
+            # Ensure every product has all keys (fill missing with None)
+            normalized_products = []
+            for p in formatted_products:
+                normalized = {key: p.get(key) for key in all_keys}
+                normalized_products.append(normalized)
+
+            # Use direct POST with Prefer header for upsert
+            endpoint = f"{self.base_url}/rest/v1/products"
+            headers = {
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            }
+
+            # Insert in chunks to keep requests reasonable
+            chunk_size = 50  # Smaller chunks for embeddings
+            success_count = 0
+
+            for i in range(0, len(normalized_products), chunk_size):
+                chunk = normalized_products[i:i + chunk_size]
+
+                try:
+                    resp = self.session.post(
+                        endpoint,
+                        headers=headers,
+                        data=json.dumps(chunk),
+                        timeout=60
+                    )
+                    if resp.status_code in (200, 201, 204):
+                        success_count += len(chunk)
+                        logger.debug(f"Successfully upserted batch of {len(chunk)} products")
+                    else:
+                        logger.error(f"Failed to upsert batch: {resp.status_code} {resp.text}")
+                        continue
+
+                except Exception as batch_error:
+                    logger.error(f"Failed to upsert batch: {batch_error}")
+                    continue
+
+            logger.info(f"Successfully upserted {success_count} products")
+            return success_count > 0
+
+        except Exception as e:
+            logger.error(f"Failed to upsert products: {e}")
+            return False
+
+    def _format_product_for_db(self, product: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Format a product dictionary for database insertion.
+        """
+        try:
+            # Required fields
+            source = product.get('source', 'scraper')
+            product_url = product.get('product_url')
+            image_url = product.get('image_url')
+            title = product.get('title')
+
+            if not source or not product_url or not image_url or not title:
+                logger.warning(f"Missing required fields: {product}")
+                return None
+
+            # Generate deterministic ID from source and product_url
+            id_string = f"{source}:{product_url}"
+            product_id = hashlib.sha256(id_string.encode('utf-8')).hexdigest()
+
+            # Build the formatted product
+            formatted = {
+                'id': product_id,
+                'source': source,
+                'product_url': product_url,
+                'image_url': image_url,
+                'title': title,
+                'brand': product.get('brand'),
+                'gender': product.get('gender'),
+                'price': product.get('price'),
+                'currency': product.get('currency', 'USD'),
+                'size': product.get('size'),
+                'second_hand': product.get('second_hand', False)
+            }
+
+            # Optional fields
+            for field in ['affiliate_url', 'description', 'category', 'embedding']:
+                if field in product and product[field] is not None:
+                    formatted[field] = product[field]
+
+            # Optional metadata
+            metadata = {}
+            if 'metadata' in product and product['metadata']:
+                if isinstance(product['metadata'], str):
+                    try:
+                        metadata = json.loads(product['metadata'])
+                    except:
+                        metadata = {'raw_metadata': product['metadata']}
+                elif isinstance(product['metadata'], dict):
+                    metadata = product['metadata']
+
+            if metadata:
+                formatted['metadata'] = json.dumps(metadata)
+
+            return formatted
+
+        except Exception as e:
+            logger.error(f"Failed to format product: {e}")
+            return None
+
+
 class DavrilSupplyScraper:
     def __init__(self, supabase_url: str, supabase_key: str):
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
-        # Initialize Supabase client
-        try:
-            self.supabase: Client = create_client(supabase_url, supabase_key)
-        except Exception as e:
-            logger.warning(f"Failed to initialize Supabase client: {e}")
-            # Try with minimal options
-            self.supabase: Client = create_client(supabase_url, supabase_key)
+        # Initialize Supabase REST client
+        self.supabase = SupabaseREST(supabase_url, supabase_key)
 
         # Initialize the embedding model
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -538,63 +689,29 @@ class DavrilSupplyScraper:
             return None
 
     def save_product_to_supabase(self, product_data: dict):
-        """Save product data to Supabase with deduplication"""
+        """Save product data to Supabase using REST API"""
         try:
-            # First, try a simple query to test the connection
-            test_query = self.supabase.table('products').select('count', count='exact').limit(1).execute()
-            logger.debug("Supabase connection test successful")
-
-        except Exception as conn_e:
-            logger.error(f"Supabase connection failed: {conn_e}")
-            # Try to reinitialize the client
-            try:
-                self.supabase = create_client(self.supabase_url, self.supabase_key)
-                logger.info("Reinitialized Supabase client")
-            except Exception as reinit_e:
-                logger.error(f"Failed to reinitialize Supabase client: {reinit_e}")
-                return False
-
-        try:
-            # Check if product already exists (by source and product_url or title)
-            existing_products = self.supabase.table('products').select('id').eq('source', 'scraper').eq('title', product_data['title']).execute()
-
-            if existing_products.data:
-                logger.info(f"Product already exists: {product_data['title']}")
-                return True  # Consider it successful since it already exists
-
             # Generate embedding if image_url exists
             if product_data.get('image_url'):
-                logger.info(f"Generating embedding for: {product_data['title']}")
+                logger.debug(f"Generating embedding for: {product_data['title']}")
                 embedding = self.generate_image_embedding(product_data['image_url'])
                 if embedding:
                     product_data['embedding'] = embedding
                 else:
                     logger.warning(f"Could not generate embedding for product: {product_data['title']}")
-                    # Still save the product but without embedding
-                    pass
 
-            # Insert into Supabase
-            result = self.supabase.table('products').insert(product_data).execute()
+            # Use REST API to upsert the product
+            success = self.supabase.upsert_products([product_data])
 
-            logger.info(f"Successfully saved product: {product_data['title']}")
-            return True
+            if success:
+                logger.info(f"Successfully saved product: {product_data['title']}")
+            else:
+                logger.error(f"Failed to save product: {product_data['title']}")
+
+            return success
 
         except Exception as e:
             logger.error(f"Error saving product to Supabase: {e}")
-            # Try to update if it already exists with different data
-            try:
-                # Check if the error is due to unique constraint violation
-                if 'duplicate key' in str(e).lower() or 'unique constraint' in str(e).lower():
-                    logger.info(f"Product already exists (constraint violation): {product_data['title']}")
-                    return True
-            except:
-                pass
-
-            # If it's the service_role_key configuration error, try a different approach
-            if 'service_role_key' in str(e).lower():
-                logger.warning("Service role key configuration error detected, product not saved")
-                return False
-
             return False
 
     def scrape_all_categories(self):
