@@ -130,10 +130,10 @@ class SupabaseREST:
             # Required fields
             source = product.get('source', 'scraper')
             product_url = product.get('product_url')
-            image_url = product.get('image_url')
+            image_url = product.get('image_url')  # Optional for embeddings
             title = product.get('title')
 
-            if not source or not product_url or not image_url or not title:
+            if not source or not product_url or not title:
                 logger.warning(f"Missing required fields: {product}")
                 return None
 
@@ -679,14 +679,19 @@ class DavrilSupplyScraper:
     def save_product_to_supabase(self, product_data: dict):
         """Save product data to Supabase using REST API"""
         try:
-            # Generate embedding if image_url exists
+            # Generate embedding if image_url exists (optional)
             if product_data.get('image_url'):
                 logger.debug(f"Generating embedding for: {product_data['title']}")
-                embedding = self.generate_image_embedding(product_data['image_url'])
-                if embedding:
-                    product_data['embedding'] = embedding
-                else:
-                    logger.warning(f"Could not generate embedding for product: {product_data['title']}")
+                try:
+                    embedding = self.generate_image_embedding(product_data['image_url'])
+                    if embedding:
+                        product_data['embedding'] = embedding
+                    else:
+                        logger.warning(f"Could not generate embedding for product: {product_data['title']}")
+                except Exception as e:
+                    logger.warning(f"Embedding generation failed for {product_data['title']}: {e}")
+            else:
+                logger.debug(f"No image available for embedding: {product_data['title']}")
 
             # Use REST API to upsert the product
             success = self.supabase.upsert_products([product_data])
