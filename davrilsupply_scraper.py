@@ -30,7 +30,13 @@ class DavrilSupplyScraper:
     def __init__(self, supabase_url: str, supabase_key: str):
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
-        self.supabase: Client = create_client(supabase_url, supabase_key)
+        # Initialize Supabase client
+        try:
+            self.supabase: Client = create_client(supabase_url, supabase_key)
+        except Exception as e:
+            logger.warning(f"Failed to initialize Supabase client: {e}")
+            # Try with minimal options
+            self.supabase: Client = create_client(supabase_url, supabase_key)
 
         # Initialize the embedding model
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -534,6 +540,21 @@ class DavrilSupplyScraper:
     def save_product_to_supabase(self, product_data: dict):
         """Save product data to Supabase with deduplication"""
         try:
+            # First, try a simple query to test the connection
+            test_query = self.supabase.table('products').select('count', count='exact').limit(1).execute()
+            logger.debug("Supabase connection test successful")
+
+        except Exception as conn_e:
+            logger.error(f"Supabase connection failed: {conn_e}")
+            # Try to reinitialize the client
+            try:
+                self.supabase = create_client(self.supabase_url, self.supabase_key)
+                logger.info("Reinitialized Supabase client")
+            except Exception as reinit_e:
+                logger.error(f"Failed to reinitialize Supabase client: {reinit_e}")
+                return False
+
+        try:
             # Check if product already exists (by source and product_url or title)
             existing_products = self.supabase.table('products').select('id').eq('source', 'scraper').eq('title', product_data['title']).execute()
 
@@ -568,6 +589,12 @@ class DavrilSupplyScraper:
                     return True
             except:
                 pass
+
+            # If it's the service_role_key configuration error, try a different approach
+            if 'service_role_key' in str(e).lower():
+                logger.warning("Service role key configuration error detected, product not saved")
+                return False
+
             return False
 
     def scrape_all_categories(self):
