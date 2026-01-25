@@ -446,14 +446,10 @@ class DavrilSupplyScraper:
             size_matches = re.findall(r'\b(S|M|L|XL)\b', container_text)
             sizes = list(set(size_matches))  # Remove duplicates
 
-            # Generate unique ID
-            product_id = str(uuid.uuid4())
-
             # Extract category from URL
             category = self.extract_category_from_url(category_url)
 
             product_data = {
-                'id': product_id,
                 'source': 'scraper',
                 'brand': 'Davril Supply',
                 'title': title,
@@ -494,15 +490,11 @@ class DavrilSupplyScraper:
                 logger.warning(f"Could not parse price: {price_text}")
                 return None
 
-            # Generate unique ID
-            product_id = str(uuid.uuid4())
-
             # Extract category from URL
             category = self.extract_category_from_url(category_url)
 
             # Create basic product data
             product_data = {
-                'id': product_id,
                 'source': 'scraper',
                 'brand': 'Davril Supply',
                 'title': title,
@@ -621,14 +613,10 @@ class DavrilSupplyScraper:
             for button in size_buttons:
                 sizes.append(button.get_text().strip())
 
-            # Generate unique ID
-            product_id = str(uuid.uuid4())
-
             # Extract category from URL
             category = self.extract_category_from_url(category_url)
 
             product_data = {
-                'id': product_id,
                 'source': 'scraper',
                 'brand': 'Davril Supply',
                 'title': title,
