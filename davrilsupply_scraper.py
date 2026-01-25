@@ -130,10 +130,10 @@ class SupabaseREST:
             # Required fields
             source = product.get('source', 'scraper')
             product_url = product.get('product_url')
-            image_url = product.get('image_url')  # Optional for embeddings
+            image_url = product.get('image_url')
             title = product.get('title')
 
-            if not source or not product_url or not title:
+            if not source or not product_url or not image_url or not title:
                 logger.warning(f"Missing required fields: {product}")
                 return None
 
@@ -428,17 +428,138 @@ class DavrilSupplyScraper:
                 logger.warning(f"Could not parse price: {price_text}")
                 return None
 
-            # Find image - look for img tag near the link
+            # Find image - comprehensive search for product images
             image_url = None
+
+            # Method 1: Look for img tag within the product container and nearby elements
             container = link.parent
-            img = container.find('img') or link.find('img')
+            img = container.find('img')
             if img:
-                src = img.get('src')
+                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or img.get('data-original')
                 if src:
                     if not src.startswith('http'):
                         image_url = urljoin(self.base_url, src)
                     else:
                         image_url = src
+
+            # Method 2: If not found, look in parent containers (up to 3 levels)
+            if not image_url:
+                parent = container.parent
+                for _ in range(3):
+                    if parent:
+                        img = parent.find('img')
+                        if img:
+                            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or img.get('data-original')
+                            if src and ('product' in src.lower() or 'image' in src.lower()):
+                                if not src.startswith('http'):
+                                    image_url = urljoin(self.base_url, src)
+                                else:
+                                    image_url = src
+                                break
+                    parent = parent.parent if parent else None
+
+            # Method 3: Look for images by alt text matching product title
+            if not image_url:
+                title_lower = title.lower()
+                all_images = soup.find_all('img', {'src': True})
+                for img in all_images:
+                    alt_text = img.get('alt', '').lower()
+                    # Check if alt text contains product title words
+                    if any(word in alt_text for word in title_lower.split() if len(word) > 2):
+                        src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or img.get('data-original')
+                        if src and ('product' in src.lower() or 'http' in src):
+                            if not src.startswith('http'):
+                                image_url = urljoin(self.base_url, src)
+                            else:
+                                image_url = src
+                            break
+
+            # Method 4: Visit the product page to get the main product image
+            if not image_url:
+                try:
+                    logger.debug(f"Visiting product page for image: {product_url}")
+                    product_html = self.get_page_content(product_url)
+                    if product_html:
+                        product_soup = BeautifulSoup(product_html, 'html.parser')
+
+                        # Look for main product image with various selectors
+                        product_img = None
+
+                        # Try common product image selectors
+                        selectors = [
+                            'img[data-image]',
+                            'img.product-image',
+                            'img.main-image',
+                            '.product-image img',
+                            '.main-image img',
+                            '#product-image img',
+                            '.gallery img',
+                            '.product-gallery img'
+                        ]
+
+                        for selector in selectors:
+                            product_img = product_soup.select_one(selector)
+                            if product_img:
+                                break
+
+                        # If not found, look for largest image on the page
+                        if not product_img:
+                            all_imgs = product_soup.find_all('img')
+                            largest_img = None
+                            max_size = 0
+
+                            for img in all_imgs:
+                                src = img.get('src') or img.get('data-src')
+                                if src and ('product' in src.lower() or 'image' in src.lower()):
+                                    # Try to estimate image size from attributes
+                                    width = img.get('width') or img.get('data-width')
+                                    height = img.get('height') or img.get('data-height')
+
+                                    if width and height:
+                                        try:
+                                            size = int(width) * int(height)
+                                            if size > max_size:
+                                                max_size = size
+                                                largest_img = img
+                                        except:
+                                            pass
+
+                                    # If no size info, just take the first product-related image
+                                    if not largest_img and ('product' in src.lower()):
+                                        largest_img = img
+
+                            product_img = largest_img
+
+                        if product_img:
+                            src = product_img.get('src') or product_img.get('data-src') or product_img.get('data-original')
+                            if src:
+                                if not src.startswith('http'):
+                                    image_url = urljoin(self.base_url, src)
+                                else:
+                                    image_url = src
+                                logger.debug(f"Found product image: {image_url}")
+
+                except Exception as e:
+                    logger.debug(f"Could not extract image from product page: {e}")
+
+            # If still no image found, try one more approach - look for images in the same row/section
+            if not image_url:
+                # Find the product card/section and look for images within it
+                product_card = link
+                for _ in range(5):  # Go up 5 levels max to find product card
+                    product_card = product_card.parent
+                    if product_card and product_card.get('class'):
+                        classes = ' '.join(product_card.get('class', []))
+                        if any(keyword in classes.lower() for keyword in ['product', 'card', 'item', 'grid-item']):
+                            img = product_card.find('img')
+                            if img:
+                                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                                if src:
+                                    if not src.startswith('http'):
+                                        image_url = urljoin(self.base_url, src)
+                                    else:
+                                        image_url = src
+                                    break
 
             # Extract sizes if available (look for S, M, L, XL in the container)
             sizes = []
@@ -677,29 +798,34 @@ class DavrilSupplyScraper:
             return None
 
     def save_product_to_supabase(self, product_data: dict):
-        """Save product data to Supabase using REST API"""
+        """Save product data to Supabase using REST API - images and embeddings required"""
         try:
-            # Generate embedding if image_url exists (optional)
-            if product_data.get('image_url'):
-                logger.debug(f"Generating embedding for: {product_data['title']}")
-                try:
-                    embedding = self.generate_image_embedding(product_data['image_url'])
-                    if embedding:
-                        product_data['embedding'] = embedding
-                    else:
-                        logger.warning(f"Could not generate embedding for product: {product_data['title']}")
-                except Exception as e:
-                    logger.warning(f"Embedding generation failed for {product_data['title']}: {e}")
-            else:
-                logger.debug(f"No image available for embedding: {product_data['title']}")
+            # Images are REQUIRED for embeddings
+            if not product_data.get('image_url'):
+                logger.error(f"No image URL for product: {product_data['title']} - cannot generate embedding")
+                return False
 
-            # Use REST API to upsert the product
+            # Generate embedding (REQUIRED)
+            logger.debug(f"Generating embedding for: {product_data['title']}")
+            try:
+                embedding = self.generate_image_embedding(product_data['image_url'])
+                if embedding:
+                    product_data['embedding'] = embedding
+                    logger.debug(f"Successfully generated embedding for: {product_data['title']}")
+                else:
+                    logger.error(f"Could not generate embedding for product: {product_data['title']}")
+                    return False
+            except Exception as e:
+                logger.error(f"Embedding generation failed for {product_data['title']}: {e}")
+                return False
+
+            # Use REST API to upsert the product with embedding
             success = self.supabase.upsert_products([product_data])
 
             if success:
-                logger.info(f"Successfully saved product: {product_data['title']}")
+                logger.info(f"Successfully saved product with embedding: {product_data['title']}")
             else:
-                logger.error(f"Failed to save product: {product_data['title']}")
+                logger.error(f"Failed to save product to database: {product_data['title']}")
 
             return success
 
