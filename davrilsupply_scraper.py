@@ -354,6 +354,42 @@ class DavrilSupplyScraper:
                 return c
         return None
 
+    def _fetch_image_from_shopify_json(self, product_url: str) -> Optional[str]:
+        """
+        Fetch product image from Shopify JSON API (/products/{handle}.json).
+        Returns product.image.src or product.images[0].src, or None.
+        """
+        try:
+            m = re.search(r"/products/([^/?#]+)", product_url)
+            if not m:
+                return None
+            handle = m.group(1).strip()
+            if not handle:
+                return None
+            json_url = f"{self.base_url.rstrip('/')}/products/{handle}.json"
+            resp = self.scraper.get(json_url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            product = data.get("product")
+            if not product:
+                return None
+            img = product.get("image")
+            if img and isinstance(img, dict) and img.get("src"):
+                u = img["src"]
+                if self._is_valid_image_url(u):
+                    return u
+            images = product.get("images")
+            if images and isinstance(images, list):
+                for im in images:
+                    if isinstance(im, dict) and im.get("src"):
+                        u = im["src"]
+                        if self._is_valid_image_url(u):
+                            return u
+            return None
+        except Exception as e:
+            logger.debug(f"Shopify JSON image fetch failed for {product_url}: {e}")
+            return None
+
     def extract_product_from_link(self, link, category_url: str, soup) -> dict:
         """Extract product data from a product link element"""
         try:
@@ -510,6 +546,12 @@ class DavrilSupplyScraper:
                         if u and ('product' in u.lower() or 'http' in u):
                             image_url = u
                             break
+
+            # Method 3b: Shopify product JSON API (reliable CDN image URLs)
+            if not image_url and "/products/" in product_url:
+                image_url = self._fetch_image_from_shopify_json(product_url)
+                if image_url:
+                    logger.debug(f"Got image from Shopify JSON: {image_url[:80]}...")
 
             # Method 4: visit product page for main image
             if not image_url:
