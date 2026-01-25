@@ -13,3 +13,4 @@ pandas>=2.1.0
 lxml>=4.9.0
 fake-useragent>=1.4.0
 cloudscraper>=1.2.0
+sentencepiece>=0.1.99
