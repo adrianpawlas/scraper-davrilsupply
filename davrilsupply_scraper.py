@@ -126,9 +126,11 @@ class SupabaseREST:
     def _format_product_for_db(self, product: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Format a product dictionary for database insertion.
+        Schema: source, brand, image_embedding, image_url, additional_images,
+        product_url, title, gender, price (e.g. "20.90EUR,22.57USD"), second_hand,
+        metadata, created_at, info_embedding, category.
         """
         try:
-            # Required fields
             source = product.get('source', 'scraper')
             product_url = product.get('product_url')
             image_url = product.get('image_url')
@@ -138,41 +140,39 @@ class SupabaseREST:
                 logger.warning(f"Missing required fields: {product}")
                 return None
 
-            # Generate deterministic ID from source and product_url
             id_string = f"{source}:{product_url}"
             product_id = hashlib.sha256(id_string.encode('utf-8')).hexdigest()
 
-            # Build the formatted product
             formatted = {
                 'id': product_id,
                 'source': source,
-                'product_url': product_url,
+                'brand': product.get('brand', 'Davril Supply'),
                 'image_url': image_url,
+                'product_url': product_url,
                 'title': title,
-                'brand': product.get('brand'),
-                'gender': product.get('gender'),
+                'gender': product.get('gender', 'man'),
                 'price': product.get('price'),
-                'currency': product.get('currency', 'USD'),
-                'size': product.get('size'),
-                'second_hand': product.get('second_hand', False)
+                'second_hand': product.get('second_hand', False),
             }
 
-            # Optional fields
-            for field in ['affiliate_url', 'description', 'category', 'embedding']:
+            # Optional fields aligned with products table
+            for field in [
+                'affiliate_url', 'description', 'category', 'size',
+                'image_embedding', 'info_embedding', 'additional_images',
+            ]:
                 if field in product and product[field] is not None:
                     formatted[field] = product[field]
 
-            # Optional metadata
             metadata = {}
-            if 'metadata' in product and product['metadata']:
-                if isinstance(product['metadata'], str):
+            if product.get('metadata'):
+                m = product['metadata']
+                if isinstance(m, str):
                     try:
-                        metadata = json.loads(product['metadata'])
-                    except:
-                        metadata = {'raw_metadata': product['metadata']}
-                elif isinstance(product['metadata'], dict):
-                    metadata = product['metadata']
-
+                        metadata = json.loads(m)
+                    except Exception:
+                        metadata = {'raw_metadata': m}
+                elif isinstance(m, dict):
+                    metadata = m
             if metadata:
                 formatted['metadata'] = json.dumps(metadata)
 
@@ -359,6 +359,16 @@ class DavrilSupplyScraper:
         Fetch product image from Shopify JSON API (/products/{handle}.json).
         Returns product.image.src or product.images[0].src, or None.
         """
+        info = self._fetch_product_json(product_url)
+        return info[0] if info else None
+
+    def _fetch_product_json(
+        self, product_url: str
+    ) -> Optional[tuple[Optional[str], List[str], Optional[str]]]:
+        """
+        Fetch product data from Shopify JSON API (/products/{handle}.json).
+        Returns (main_image_url, list of additional image URLs, description) or None.
+        """
         try:
             m = re.search(r"/products/([^/?#]+)", product_url)
             if not m:
@@ -373,21 +383,39 @@ class DavrilSupplyScraper:
             product = data.get("product")
             if not product:
                 return None
+            main_url: Optional[str] = None
+            additional: List[str] = []
             img = product.get("image")
             if img and isinstance(img, dict) and img.get("src"):
                 u = img["src"]
                 if self._is_valid_image_url(u):
-                    return u
-            images = product.get("images")
-            if images and isinstance(images, list):
+                    main_url = u
+            images = product.get("images") or []
+            if isinstance(images, list):
                 for im in images:
                     if isinstance(im, dict) and im.get("src"):
                         u = im["src"]
-                        if self._is_valid_image_url(u):
-                            return u
-            return None
+                        if not self._is_valid_image_url(u):
+                            continue
+                        if main_url is None:
+                            main_url = u
+                        elif u != main_url and u not in additional:
+                            additional.append(u)
+                if main_url is None and images:
+                    first = next(
+                        (im["src"] for im in images if isinstance(im, dict) and im.get("src") and self._is_valid_image_url(im["src"])),
+                        None
+                    )
+                    if first:
+                        main_url = first
+                        additional = [
+                            im["src"] for im in images
+                            if isinstance(im, dict) and im.get("src") and self._is_valid_image_url(im["src"]) and im["src"] != main_url
+                        ]
+            body = (product.get("body_html") or "").strip() or None
+            return (main_url, additional, body)
         except Exception as e:
-            logger.debug(f"Shopify JSON image fetch failed for {product_url}: {e}")
+            logger.debug(f"Shopify JSON fetch failed for {product_url}: {e}")
             return None
 
     def extract_product_from_link(self, link, category_url: str, soup) -> dict:
@@ -598,6 +626,18 @@ class DavrilSupplyScraper:
                     if image_url:
                         break
 
+            # Enrich from Shopify JSON (additional images, description); can also supply main image
+            additional_images_list: List[str] = []
+            description = None
+            if "/products/" in product_url:
+                json_info = self._fetch_product_json(product_url)
+                if json_info:
+                    main_from_json, additional_from_json, desc_from_json = json_info
+                    if not image_url and main_from_json:
+                        image_url = main_from_json
+                    additional_images_list = additional_from_json or []
+                    description = desc_from_json
+
             if not image_url or not self._is_valid_image_url(image_url):
                 logger.warning(f"No valid image URL for product: {title}")
                 return None
@@ -608,21 +648,31 @@ class DavrilSupplyScraper:
             size_matches = re.findall(r'\b(S|M|L|XL)\b', container_text)
             sizes = list(set(size_matches))  # Remove duplicates
 
-            # Extract category from URL
+            # Extract category from URL and normalize: "Sweaters & Hoodies" -> "Sweaters, Hoodies"
             category = self.extract_category_from_url(category_url)
+            if category:
+                category = re.sub(r"\s+&\s+", ", ", category)
+                category = re.sub(r"\s+and\s+", ", ", category, flags=re.IGNORECASE)
+
+            # Price string: multiple currencies "20.90EUR,22.57USD"
+            price_str = f"{eur_price:.2f}EUR,{price:.2f}USD"
+
+            # additional_images format: "url1 , url2" (comma and space)
+            additional_images_str = " , ".join(additional_images_list) if additional_images_list else None
 
             product_data = {
                 'source': 'scraper',
                 'brand': 'Davril Supply',
                 'title': title,
-                'price': price,
-                'currency': 'USD',
+                'price': price_str,
                 'image_url': image_url,
                 'product_url': product_url,
                 'category': category,
                 'gender': 'man',
                 'second_hand': False,
                 'size': ','.join(sizes) if sizes else None,
+                'additional_images': additional_images_str,
+                'description': description,
                 'metadata': json.dumps({
                     'sizes': sizes,
                     'original_price_text': price_text,
@@ -652,16 +702,17 @@ class DavrilSupplyScraper:
                 logger.warning(f"Could not parse price: {price_text}")
                 return None
 
-            # Extract category from URL
             category = self.extract_category_from_url(category_url)
+            if category:
+                category = re.sub(r"\s+&\s+", ", ", category)
+                category = re.sub(r"\s+and\s+", ", ", category, flags=re.IGNORECASE)
+            price_str = f"{eur_price:.2f}EUR,{price:.2f}USD"
 
-            # Create basic product data
             product_data = {
                 'source': 'scraper',
                 'brand': 'Davril Supply',
                 'title': title,
-                'price': price,
-                'currency': 'USD',
+                'price': price_str,
                 'category': category,
                 'gender': 'man',
                 'second_hand': False,
@@ -671,7 +722,6 @@ class DavrilSupplyScraper:
                     'extraction_method': 'text_analysis'
                 })
             }
-
             return product_data
 
         except Exception as e:
@@ -770,15 +820,17 @@ class DavrilSupplyScraper:
             for button in size_buttons:
                 sizes.append(button.get_text().strip())
 
-            # Extract category from URL
             category = self.extract_category_from_url(category_url)
+            if category:
+                category = re.sub(r"\s+&\s+", ", ", category)
+                category = re.sub(r"\s+and\s+", ", ", category, flags=re.IGNORECASE)
+            price_str = f"{eur_price:.2f}EUR,{price:.2f}USD"
 
             product_data = {
                 'source': 'scraper',
                 'brand': 'Davril Supply',
                 'title': title,
-                'price': price,
-                'currency': 'USD',  # Convert to USD as requested
+                'price': price_str,
                 'image_url': image_url,
                 'product_url': product_url,
                 'category': category,
@@ -791,7 +843,6 @@ class DavrilSupplyScraper:
                     'category_url': category_url
                 })
             }
-
             return product_data
 
         except Exception as e:
@@ -831,47 +882,92 @@ class DavrilSupplyScraper:
                 raw = response.content
 
             image = Image.open(io.BytesIO(raw)).convert("RGB")
-            # SigLIP requires both image and text inputs - provide dummy text for image-only embedding
-            inputs = self.processor(images=image, text=[""], return_tensors="pt").to(self.device)
+            # Use SigLIP image encoder only (768-dim)
+            try:
+                inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+            except Exception:
+                inputs = self.processor(images=image, text=[""], return_tensors="pt").to(self.device)
+            pixel_values = inputs["pixel_values"]
             with torch.no_grad():
-                outputs = self.model(**inputs)
-            # Use vision embeddings for image representation
-            embeddings = outputs.vision_pooler_output.cpu().numpy().flatten().tolist()
+                out = self.model.get_image_features(pixel_values=pixel_values)
+            # Handle both tensor and BaseModelOutputWithPooling (transformers version variance)
+            if hasattr(out, "pooler_output") and out.pooler_output is not None:
+                feat = out.pooler_output
+            elif hasattr(out, "last_hidden_state"):
+                feat = out.last_hidden_state[:, 0, :]
+            else:
+                feat = out
+            embeddings = feat.cpu().numpy().flatten().tolist()
             return embeddings
         except Exception as e:
             logger.error(f"Error generating embedding for {image_url[:80]}...: {e}")
             return None
 
-    def save_product_to_supabase(self, product_data: dict):
-        """Save product data to Supabase using REST API - images and embeddings required"""
+    def generate_text_embedding(self, text: str) -> Optional[list]:
+        """Generate 768-dim text embedding using SigLIP text encoder (same model as image)."""
+        if not text or not text.strip():
+            return None
         try:
-            # Images are REQUIRED for embeddings
+            # SigLIP expects padding='max_length' for text
+            inputs = self.processor(
+                text=[text.strip()],
+                padding="max_length",
+                max_length=64,
+                return_tensors="pt",
+                truncation=True,
+            ).to(self.device)
+            kwargs = {"input_ids": inputs["input_ids"]}
+            if "attention_mask" in inputs:
+                kwargs["attention_mask"] = inputs["attention_mask"]
+            with torch.no_grad():
+                out = self.model.get_text_features(**kwargs)
+            if hasattr(out, "pooler_output") and out.pooler_output is not None:
+                feat = out.pooler_output
+            elif hasattr(out, "last_hidden_state"):
+                feat = out.last_hidden_state[:, 0, :]
+            else:
+                feat = out
+            return feat.cpu().numpy().flatten().tolist()
+        except Exception as e:
+            logger.error(f"Error generating text embedding: {e}")
+            return None
+
+    def save_product_to_supabase(self, product_data: dict):
+        """Save product data to Supabase - image_embedding and info_embedding required."""
+        try:
             if not product_data.get('image_url'):
                 logger.error(f"No image URL for product: {product_data['title']} - cannot generate embedding")
                 return False
 
-            # Generate embedding (REQUIRED)
-            logger.debug(f"Generating embedding for: {product_data['title']}")
-            try:
-                embedding = self.generate_image_embedding(product_data['image_url'])
-                if embedding:
-                    product_data['embedding'] = embedding
-                    logger.debug(f"Successfully generated embedding for: {product_data['title']}")
-                else:
-                    logger.error(f"Could not generate embedding for product: {product_data['title']}")
-                    return False
-            except Exception as e:
-                logger.error(f"Embedding generation failed for {product_data['title']}: {e}")
+            # Image embedding (768-dim from google/siglip-base-patch16-384)
+            logger.debug(f"Generating image embedding for: {product_data['title']}")
+            image_emb = self.generate_image_embedding(product_data['image_url'])
+            if not image_emb:
+                logger.error(f"Could not generate image embedding for product: {product_data['title']}")
                 return False
+            product_data['image_embedding'] = image_emb
 
-            # Use REST API to upsert the product with embedding
+            # Info embedding: concatenate title, price, description, category, gender, metadata
+            info_parts = [
+                product_data.get('title') or '',
+                product_data.get('price') or '',
+                product_data.get('description') or '',
+                product_data.get('category') or '',
+                product_data.get('gender') or '',
+            ]
+            if product_data.get('metadata'):
+                info_parts.append(product_data['metadata'] if isinstance(product_data['metadata'], str) else json.dumps(product_data['metadata']))
+            info_text = " ".join(p for p in info_parts if p).strip()
+            if info_text:
+                info_emb = self.generate_text_embedding(info_text)
+                if info_emb:
+                    product_data['info_embedding'] = info_emb
+
             success = self.supabase.upsert_products([product_data])
-
             if success:
-                logger.info(f"Successfully saved product with embedding: {product_data['title']}")
+                logger.info(f"Successfully saved product: {product_data['title']}")
             else:
                 logger.error(f"Failed to save product to database: {product_data['title']}")
-
             return success
 
         except Exception as e:
