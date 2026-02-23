@@ -4,6 +4,13 @@ Full scraper runner for Davril Supply
 """
 
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from project directory (critical for scheduled runs where cwd may differ)
+script_dir = Path(__file__).resolve().parent
+load_dotenv(script_dir / ".env", override=False)
+
 import logging
 from davrilsupply_scraper import DavrilSupplyScraper
 

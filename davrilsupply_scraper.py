@@ -43,6 +43,47 @@ class SupabaseREST:
             "Content-Type": "application/json",
         })
 
+    def get_existing_product_ids(self, source: str) -> set:
+        """
+        Fetch all product IDs for a given source. Used for smart sync.
+        Returns a set of id strings.
+        """
+        try:
+            endpoint = f"{self.base_url}/rest/v1/products"
+            params = {"source": f"eq.{source}", "select": "id"}
+            resp = self.session.get(endpoint, params=params, timeout=60)
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch existing products: {resp.status_code} {resp.text}")
+                return set()
+            rows = resp.json()
+            return {r["id"] for r in rows if r.get("id")}
+        except Exception as e:
+            logger.error(f"Failed to fetch existing product IDs: {e}")
+            return set()
+
+    def delete_products_by_ids(self, ids: List[str]) -> bool:
+        """
+        Delete products by id. PostgREST: DELETE where id=in.(id1,id2,...)
+        """
+        if not ids:
+            return True
+        try:
+            endpoint = f"{self.base_url}/rest/v1/products"
+            # PostgREST in() filter: id=in.(id1,id2,...)
+            chunk_size = 100
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i : i + chunk_size]
+                in_filter = ",".join(f'"{x}"' for x in chunk)
+                params = {"id": f"in.({in_filter})"}
+                resp = self.session.delete(endpoint, params=params, timeout=60)
+                if resp.status_code not in (200, 204):
+                    logger.error(f"Failed to delete products: {resp.status_code} {resp.text}")
+                    return False
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete products: {e}")
+            return False
+
     def upsert_products(self, products: List[Dict[str, Any]]) -> bool:
         """
         Upsert products into the database.
@@ -183,10 +224,15 @@ class SupabaseREST:
             return None
 
 
+# Unique source identifier for this scraper - required for smart sync and to avoid conflicts with other scrapers
+SOURCE_NAME = "davrilsupply"
+
+
 class DavrilSupplyScraper:
-    def __init__(self, supabase_url: str, supabase_key: str):
+    def __init__(self, supabase_url: str, supabase_key: str, source: str = SOURCE_NAME):
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
+        self.source = source
         # Initialize Supabase REST client
         self.supabase = SupabaseREST(supabase_url, supabase_key)
 
@@ -661,7 +707,7 @@ class DavrilSupplyScraper:
             additional_images_str = " , ".join(additional_images_list) if additional_images_list else None
 
             product_data = {
-                'source': 'scraper',
+                'source': self.source,
                 'brand': 'Davril Supply',
                 'title': title,
                 'price': price_str,
@@ -709,7 +755,7 @@ class DavrilSupplyScraper:
             price_str = f"{eur_price:.2f}EUR,{price:.2f}USD"
 
             product_data = {
-                'source': 'scraper',
+                'source': self.source,
                 'brand': 'Davril Supply',
                 'title': title,
                 'price': price_str,
@@ -827,7 +873,7 @@ class DavrilSupplyScraper:
             price_str = f"{eur_price:.2f}EUR,{price:.2f}USD"
 
             product_data = {
-                'source': 'scraper',
+                'source': self.source,
                 'brand': 'Davril Supply',
                 'title': title,
                 'price': price_str,
@@ -974,34 +1020,73 @@ class DavrilSupplyScraper:
             logger.error(f"Error saving product to Supabase: {e}")
             return False
 
-    def scrape_all_categories(self):
-        """Scrape all category pages"""
-        total_products = 0
+    def _compute_product_id(self, product: Dict[str, Any]) -> str:
+        """Compute stable product id from source and product_url (same as DB)."""
+        source = product.get("source", self.source)
+        product_url = product.get("product_url", "")
+        id_string = f"{source}:{product_url}"
+        return hashlib.sha256(id_string.encode("utf-8")).hexdigest()
 
+    def scrape_all_categories(self):
+        """
+        Scrape all category pages and perform smart sync:
+        - New products: insert (with embeddings)
+        - Existing products: leave as-is (no overwrite)
+        - Products no longer in catalog: delete from DB
+        """
+        # 1. Collect all products from all categories
+        all_products: List[Dict[str, Any]] = []
         for category_url in self.category_urls:
             logger.info(f"Scraping category: {category_url}")
-
-            # Get page content
             html_content = self.get_page_content(category_url)
-
             if not html_content:
                 logger.error(f"Could not fetch content for {category_url}")
                 continue
-
-            # Extract products
             products = self.extract_products_from_page(html_content, category_url)
-
             logger.info(f"Found {len(products)} products in {category_url}")
-
-            # Save products to database
-            for product in products:
-                if self.save_product_to_supabase(product):
-                    total_products += 1
-
-            # Add delay between categories to be respectful
+            all_products.extend(products)
             time.sleep(2)
 
-        logger.info(f"Total products scraped and saved: {total_products}")
+        if not all_products:
+            logger.warning("No products scraped - skipping sync")
+            return
+
+        # Deduplicate by product_url (same product may appear in multiple categories)
+        seen_urls: set = set()
+        unique_products: List[Dict[str, Any]] = []
+        for p in all_products:
+            url = p.get("product_url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_products.append(p)
+
+        scraped_ids = {self._compute_product_id(p) for p in unique_products}
+        logger.info(f"Total unique products scraped: {len(unique_products)} (ids: {len(scraped_ids)})")
+
+        # 2. Fetch existing product IDs for this source
+        existing_ids = self.supabase.get_existing_product_ids(self.source)
+        logger.info(f"Existing products in DB for source={self.source}: {len(existing_ids)}")
+
+        # 3. New products only (do not overwrite existing)
+        new_products = [p for p in unique_products if self._compute_product_id(p) not in existing_ids]
+        to_delete_ids = list(existing_ids - scraped_ids)
+
+        logger.info(f"Smart sync: {len(new_products)} new to insert, {len(to_delete_ids)} stale to delete")
+
+        # 4. Insert new products (with embeddings)
+        inserted = 0
+        for product in new_products:
+            if self.save_product_to_supabase(product):
+                inserted += 1
+
+        # 5. Delete products no longer in catalog
+        if to_delete_ids:
+            if self.supabase.delete_products_by_ids(to_delete_ids):
+                logger.info(f"Deleted {len(to_delete_ids)} products no longer in catalog")
+            else:
+                logger.error("Failed to delete stale products")
+
+        logger.info(f"Smart sync complete: {inserted} new products inserted, {len(to_delete_ids)} removed")
 
     def run(self):
         """Main execution method"""
@@ -1011,9 +1096,14 @@ class DavrilSupplyScraper:
 
 
 if __name__ == "__main__":
-    # Supabase credentials
-    SUPABASE_URL = "https://yqawmzggcgpeyaaynrjk.supabase.co"
-    SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxYXdtemdnY2dwZXlhYXlucmprIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTAxMDkyNiwiZXhwIjoyMDcwNTg2OTI2fQ.XtLpxausFriraFJeX27ZzsdQsFv3uQKXBBggoz6P4D4"
+    from dotenv import load_dotenv
+    from pathlib import Path
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Set SUPABASE_URL and SUPABASE_KEY (env or .env)")
 
     scraper = DavrilSupplyScraper(SUPABASE_URL, SUPABASE_KEY)
     scraper.run()
