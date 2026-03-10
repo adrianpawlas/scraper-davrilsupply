@@ -225,7 +225,7 @@ class SupabaseREST:
 
 
 # Unique source identifier for this scraper - required for smart sync and to avoid conflicts with other scrapers
-SOURCE_NAME = "davrilsupply"
+SOURCE_NAME = "scraper-davrilsupply"
 
 
 class DavrilSupplyScraper:
@@ -367,6 +367,24 @@ class DavrilSupplyScraper:
             return False
         return True
 
+    def _filter_bk_ft_images(self, urls: List[str]) -> List[str]:
+        """Return only image URLs containing 'BK' or 'FT' in the path (case-sensitive)."""
+        if not urls:
+            return []
+        return [u for u in urls if u and ("BK" in u or "FT" in u)]
+
+    def _pick_image_for_embedding(self, urls: List[str]) -> Optional[str]:
+        """
+        Pick best image for embedding: prefer first URL containing BK or FT.
+        Falls back to first valid URL if no BK/FT images exist.
+        """
+        if not urls:
+            return None
+        bk_ft = self._filter_bk_ft_images(urls)
+        if bk_ft:
+            return bk_ft[0]
+        return urls[0] if urls else None
+
     def _parse_srcset_first_url(self, srcset: str) -> Optional[str]:
         """Parse srcset 'url1 1x, url2 2x' and return first URL."""
         if not srcset or not isinstance(srcset, str):
@@ -410,10 +428,11 @@ class DavrilSupplyScraper:
 
     def _fetch_product_json(
         self, product_url: str
-    ) -> Optional[tuple[Optional[str], List[str], Optional[str]]]:
+    ) -> Optional[tuple[Optional[str], List[str], Optional[str], Optional[Dict[str, Any]]]]:
         """
         Fetch product data from Shopify JSON API (/products/{handle}.json).
-        Returns (main_image_url, list of additional image URLs, description) or None.
+        Returns (main_image_url, list of additional image URLs, description, extra_metadata) or None.
+        extra_metadata: {options, product_type, vendor, tags} for metadata field.
         """
         try:
             m = re.search(r"/products/([^/?#]+)", product_url)
@@ -459,7 +478,13 @@ class DavrilSupplyScraper:
                             if isinstance(im, dict) and im.get("src") and self._is_valid_image_url(im["src"]) and im["src"] != main_url
                         ]
             body = (product.get("body_html") or "").strip() or None
-            return (main_url, additional, body)
+            extra = {
+                "options": product.get("options"),
+                "product_type": product.get("product_type"),
+                "vendor": product.get("vendor"),
+                "tags": product.get("tags"),
+            }
+            return (main_url, additional, body, extra)
         except Exception as e:
             logger.debug(f"Shopify JSON fetch failed for {product_url}: {e}")
             return None
@@ -672,16 +697,25 @@ class DavrilSupplyScraper:
                     if image_url:
                         break
 
-            # Enrich from Shopify JSON (additional images, description); can also supply main image
+            # Enrich from Shopify JSON (additional images, description); prefer BK/FT images for embedding
             additional_images_list: List[str] = []
             description = None
+            json_extra: Optional[Dict[str, Any]] = None
             if "/products/" in product_url:
                 json_info = self._fetch_product_json(product_url)
                 if json_info:
-                    main_from_json, additional_from_json, desc_from_json = json_info
-                    if not image_url and main_from_json:
+                    main_from_json, additional_from_json, desc_from_json = json_info[:3]
+                    json_extra = json_info[3] if len(json_info) > 3 else None
+                    all_json_images = ([main_from_json] if main_from_json else []) + (additional_from_json or [])
+                    all_json_images = list(dict.fromkeys(u for u in all_json_images if u and self._is_valid_image_url(u)))
+                    # Prefer BK/FT images for embedding and image_url (brand requirement)
+                    chosen_main = self._pick_image_for_embedding(all_json_images)
+                    if chosen_main:
+                        image_url = chosen_main
+                    elif main_from_json and not image_url:
                         image_url = main_from_json
-                    additional_images_list = additional_from_json or []
+                    bk_ft_images = self._filter_bk_ft_images(all_json_images)
+                    additional_images_list = [u for u in bk_ft_images if u != image_url] if bk_ft_images else []
                     description = desc_from_json
 
             if not image_url or not self._is_valid_image_url(image_url):
@@ -706,6 +740,41 @@ class DavrilSupplyScraper:
             # additional_images format: "url1 , url2" (comma and space)
             additional_images_str = " , ".join(additional_images_list) if additional_images_list else None
 
+            # Build comprehensive metadata with all product info
+            metadata_obj: Dict[str, Any] = {
+                "name": title,
+                "price": price_str,
+                "description": description,
+                "colors": [],  # populated from options if available
+                "size": ",".join(sizes) if sizes else None,
+                "sizes": sizes,
+                "category": category,
+                "gender": "man",
+                "brand": "Davril Supply",
+                "product_url": product_url,
+                "category_url": category_url,
+                "original_price_text": price_text,
+                "extraction_method": "link_based",
+            }
+            if json_extra:
+                if json_extra.get("options"):
+                    opts = json_extra["options"]
+                    for o in opts if isinstance(opts, list) else []:
+                        if isinstance(o, dict):
+                            opt_name = (o.get("name") or "").lower()
+                            opt_vals = o.get("values") or []
+                            if "color" in opt_name or "colour" in opt_name:
+                                metadata_obj["colors"] = opt_vals
+                            elif "size" in opt_name and not metadata_obj.get("sizes"):
+                                metadata_obj["sizes"] = opt_vals
+                                metadata_obj["size"] = ",".join(opt_vals) if opt_vals else metadata_obj.get("size")
+                if json_extra.get("product_type"):
+                    metadata_obj["product_type"] = json_extra["product_type"]
+                if json_extra.get("vendor"):
+                    metadata_obj["vendor"] = json_extra["vendor"]
+                if json_extra.get("tags"):
+                    metadata_obj["tags"] = json_extra["tags"]
+
             product_data = {
                 'source': self.source,
                 'brand': 'Davril Supply',
@@ -719,12 +788,7 @@ class DavrilSupplyScraper:
                 'size': ','.join(sizes) if sizes else None,
                 'additional_images': additional_images_str,
                 'description': description,
-                'metadata': json.dumps({
-                    'sizes': sizes,
-                    'original_price_text': price_text,
-                    'category_url': category_url,
-                    'extraction_method': 'link_based'
-                })
+                'metadata': json.dumps(metadata_obj)
             }
 
             return product_data
@@ -754,6 +818,20 @@ class DavrilSupplyScraper:
                 category = re.sub(r"\s+and\s+", ", ", category, flags=re.IGNORECASE)
             price_str = f"{eur_price:.2f}EUR,{price:.2f}USD"
 
+            metadata_obj = {
+                "name": title,
+                "price": price_str,
+                "description": None,
+                "colors": [],
+                "size": None,
+                "sizes": [],
+                "category": category,
+                "gender": "man",
+                "brand": "Davril Supply",
+                "category_url": category_url,
+                "original_price_text": price_text,
+                "extraction_method": "text_analysis",
+            }
             product_data = {
                 'source': self.source,
                 'brand': 'Davril Supply',
@@ -762,11 +840,7 @@ class DavrilSupplyScraper:
                 'category': category,
                 'gender': 'man',
                 'second_hand': False,
-                'metadata': json.dumps({
-                    'original_price_text': price_text,
-                    'category_url': category_url,
-                    'extraction_method': 'text_analysis'
-                })
+                'metadata': json.dumps(metadata_obj)
             }
             return product_data
 
@@ -872,6 +946,21 @@ class DavrilSupplyScraper:
                 category = re.sub(r"\s+and\s+", ", ", category, flags=re.IGNORECASE)
             price_str = f"{eur_price:.2f}EUR,{price:.2f}USD"
 
+            metadata_obj = {
+                "name": title,
+                "price": price_str,
+                "description": None,
+                "colors": [],
+                "size": ",".join(sizes) if sizes else None,
+                "sizes": sizes,
+                "category": category,
+                "gender": "man",
+                "brand": "Davril Supply",
+                "product_url": product_url,
+                "category_url": category_url,
+                "original_price_text": price_text,
+                "extraction_method": "container",
+            }
             product_data = {
                 'source': self.source,
                 'brand': 'Davril Supply',
@@ -883,11 +972,7 @@ class DavrilSupplyScraper:
                 'gender': 'man',
                 'second_hand': False,
                 'size': ','.join(sizes) if sizes else None,
-                'metadata': json.dumps({
-                    'sizes': sizes,
-                    'original_price_text': price_text,
-                    'category_url': category_url
-                })
+                'metadata': json.dumps(metadata_obj)
             }
             return product_data
 
