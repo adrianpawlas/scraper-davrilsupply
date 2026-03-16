@@ -4,6 +4,7 @@ import json
 import base64
 import hashlib
 import requests
+from datetime import datetime, timezone
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -42,6 +43,27 @@ class SupabaseREST:
             "Authorization": f"Bearer {self.key}",
             "Content-Type": "application/json",
         })
+
+    def get_all_products(self, source: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Fetch all products for a given source with full data.
+        Returns a dict mapping product_id -> product_data for smart comparison.
+        """
+        try:
+            endpoint = f"{self.base_url}/rest/v1/products"
+            params = {
+                "source": f"eq.{source}",
+                "select": "id,product_url,title,price,image_url,category,gender,size,description,additional_images,second_hand,metadata,created_at,updated_at,last_seen_at,stale_count"
+            }
+            resp = self.session.get(endpoint, params=params, timeout=60)
+            if resp.status_code != 200:
+                logger.warning(f"Failed to fetch existing products: {resp.status_code} {resp.text}")
+                return {}
+            rows = resp.json()
+            return {r["id"]: r for r in rows if r.get("id")}
+        except Exception as e:
+            logger.error(f"Failed to fetch existing products: {e}")
+            return {}
 
     def get_existing_product_ids(self, source: str) -> set:
         """
@@ -84,61 +106,51 @@ class SupabaseREST:
             logger.error(f"Failed to delete products: {e}")
             return False
 
-    def upsert_products(self, products: List[Dict[str, Any]]) -> bool:
+    def batch_upsert_products(self, products: List[Dict[str, Any]], max_retries: int = 3) -> tuple[int, int, List[Dict[str, Any]]]:
         """
-        Upsert products into the database.
-        Args:
-            products: List of product dictionaries
-        Returns:
-            True if successful, False otherwise
+        Batch upsert products with retry logic.
+        Returns (success_count, failed_count, failed_products).
         """
         if not products:
-            return True
+            return 0, 0, []
 
-        try:
-            # Format products for database
-            formatted_products = []
-            seen_ids = set()
+        formatted_products = []
+        seen_ids = set()
 
-            for product in products:
-                formatted_product = self._format_product_for_db(product)
-                if formatted_product:
-                    # Deduplicate by id
-                    product_id = formatted_product.get('id')
-                    if product_id and product_id not in seen_ids:
-                        seen_ids.add(product_id)
-                        formatted_products.append(formatted_product)
+        for product in products:
+            formatted_product = self._format_product_for_db(product)
+            if formatted_product:
+                product_id = formatted_product.get('id')
+                if product_id and product_id not in seen_ids:
+                    seen_ids.add(product_id)
+                    formatted_products.append(formatted_product)
 
-            if not formatted_products:
-                logger.warning("No valid products to upsert after formatting")
-                return False
+        if not formatted_products:
+            logger.warning("No valid products to upsert after formatting")
+            return 0, 0, []
 
-            logger.info(f"Upserting {len(formatted_products)} unique products")
+        all_keys = set()
+        for p in formatted_products:
+            all_keys.update(p.keys())
 
-            # Normalize all products to have the same keys
-            all_keys = set()
-            for p in formatted_products:
-                all_keys.update(p.keys())
+        normalized_products = []
+        for p in formatted_products:
+            normalized = {key: p.get(key) for key in all_keys}
+            normalized_products.append(normalized)
 
-            # Ensure every product has all keys (fill missing with None)
-            normalized_products = []
-            for p in formatted_products:
-                normalized = {key: p.get(key) for key in all_keys}
-                normalized_products.append(normalized)
+        endpoint = f"{self.base_url}/rest/v1/products"
+        headers = {
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
 
-            # Use direct POST with Prefer header for upsert
-            endpoint = f"{self.base_url}/rest/v1/products"
-            headers = {
-                "Prefer": "resolution=merge-duplicates,return=minimal",
-            }
+        chunk_size = 50
+        success_count = 0
+        failed_products = []
 
-            # Insert in chunks to keep requests reasonable
-            chunk_size = 50  # Smaller chunks for embeddings
-            success_count = 0
-
-            for i in range(0, len(normalized_products), chunk_size):
-                chunk = normalized_products[i:i + chunk_size]
-
+        for i in range(0, len(normalized_products), chunk_size):
+            chunk = normalized_products[i:i + chunk_size]
+            
+            for retry in range(max_retries):
                 try:
                     resp = self.session.post(
                         endpoint,
@@ -149,27 +161,41 @@ class SupabaseREST:
                     if resp.status_code in (200, 201, 204):
                         success_count += len(chunk)
                         logger.debug(f"Successfully upserted batch of {len(chunk)} products")
+                        break
                     else:
-                        logger.error(f"Failed to upsert batch: {resp.status_code} {resp.text}")
-                        continue
-
+                        if retry == max_retries - 1:
+                            logger.error(f"Failed to upsert batch after {max_retries} retries: {resp.status_code} {resp.text}")
+                            failed_products.extend(chunk)
+                        else:
+                            logger.warning(f"Retry {retry + 1}/{max_retries} for batch: {resp.status_code}")
+                            time.sleep(1)
                 except Exception as batch_error:
-                    logger.error(f"Failed to upsert batch: {batch_error}")
-                    continue
+                    if retry == max_retries - 1:
+                        logger.error(f"Failed to upsert batch after {max_retries} retries: {batch_error}")
+                        failed_products.extend(chunk)
+                    else:
+                        logger.warning(f"Retry {retry + 1}/{max_retries} for batch: {batch_error}")
+                        time.sleep(1)
 
-            logger.info(f"Successfully upserted {success_count} products")
-            return success_count > 0
+        return success_count, len(failed_products), failed_products
 
-        except Exception as e:
-            logger.error(f"Failed to upsert products: {e}")
-            return False
+    def upsert_products(self, products: List[Dict[str, Any]]) -> bool:
+        """
+        Upsert products into the database.
+        Args:
+            products: List of product dictionaries
+        Returns:
+            True if successful, False otherwise
+        """
+        success_count, _, _ = self.batch_upsert_products(products)
+        return success_count > 0
 
     def _format_product_for_db(self, product: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Format a product dictionary for database insertion.
         Schema: source, brand, image_embedding, image_url, additional_images,
         product_url, title, gender, price (e.g. "20.90EUR,22.57USD"), second_hand,
-        metadata, created_at, info_embedding, category.
+        metadata, created_at, info_embedding, category, last_seen_at, stale_count.
         """
         try:
             source = product.get('source', 'scraper')
@@ -194,6 +220,8 @@ class SupabaseREST:
                 'gender': product.get('gender', 'man'),
                 'price': product.get('price'),
                 'second_hand': product.get('second_hand', False),
+                'last_seen_at': product.get('last_seen_at'),
+                'stale_count': product.get('stale_count', 0),
             }
 
             # Optional fields aligned with products table
@@ -1116,9 +1144,20 @@ class DavrilSupplyScraper:
         """
         Scrape all category pages and perform smart sync:
         - New products: insert (with embeddings)
-        - Existing products: leave as-is (no overwrite)
-        - Products no longer in catalog: delete from DB
+        - Existing products with changes: update (regenerate embeddings only if image changed)
+        - Existing products unchanged: skip (no DB update, no embedding regeneration)
+        - Products not seen for 2 consecutive runs: delete
         """
+        from datetime import datetime, timezone
+        
+        stats = {
+            "new": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "deleted": 0,
+        }
+        failed_products_log = []
+        
         # 1. Collect all products from all categories
         all_products: List[Dict[str, Any]] = []
         for category_url in self.category_urls:
@@ -1134,6 +1173,7 @@ class DavrilSupplyScraper:
 
         if not all_products:
             logger.warning("No products scraped - skipping sync")
+            self._print_summary(stats)
             return
 
         # Deduplicate by product_url (same product may appear in multiple categories)
@@ -1148,30 +1188,226 @@ class DavrilSupplyScraper:
         scraped_ids = {self._compute_product_id(p) for p in unique_products}
         logger.info(f"Total unique products scraped: {len(unique_products)} (ids: {len(scraped_ids)})")
 
-        # 2. Fetch existing product IDs for this source
-        existing_ids = self.supabase.get_existing_product_ids(self.source)
+        # 2. Fetch all existing products with full data for smart comparison
+        existing_products = self.supabase.get_all_products(self.source)
+        existing_ids = set(existing_products.keys())
         logger.info(f"Existing products in DB for source={self.source}: {len(existing_ids)}")
 
-        # 3. New products only (do not overwrite existing)
-        new_products = [p for p in unique_products if self._compute_product_id(p) not in existing_ids]
-        to_delete_ids = list(existing_ids - scraped_ids)
+        # Current timestamp for last_seen_at
+        now = datetime.now(timezone.utc).isoformat()
 
-        logger.info(f"Smart sync: {len(new_products)} new to insert, {len(to_delete_ids)} stale to delete")
+        # 3. Categorize products: new, updated, unchanged
+        new_products = []
+        updated_products = []
+        unchanged_product_ids = []
 
-        # 4. Insert new products (with embeddings)
-        inserted = 0
-        for product in new_products:
-            if self.save_product_to_supabase(product):
-                inserted += 1
+        for product in unique_products:
+            product_id = self._compute_product_id(product)
+            
+            if product_id not in existing_ids:
+                # New product - will need embeddings
+                new_products.append(product)
+            else:
+                # Existing product - check if anything changed
+                existing = existing_products[product_id]
+                
+                # Compare key fields
+                has_changes = (
+                    product.get('title') != existing.get('title') or
+                    product.get('price') != existing.get('price') or
+                    product.get('image_url') != existing.get('image_url') or
+                    product.get('category') != existing.get('category') or
+                    product.get('gender') != existing.get('gender') or
+                    product.get('size') != existing.get('size') or
+                    product.get('description') != existing.get('description') or
+                    product.get('additional_images') != existing.get('additional_images') or
+                    product.get('second_hand') != existing.get('second_hand')
+                )
+                
+                if has_changes:
+                    # Product changed - will need embeddings if image changed
+                    updated_products.append(product)
+                else:
+                    # Product unchanged - skip entirely
+                    unchanged_product_ids.append(product_id)
+                    stats["unchanged"] += 1
 
-        # 5. Delete products no longer in catalog
+        # 4. Determine stale products (not seen in current scrape)
+        # Products that were in DB but not in current scrape
+        to_increment_stale = list(existing_ids - scraped_ids)
+        
+        # Products that have been stale for 2 consecutive runs - to delete
+        to_delete_ids = []
+        
+        for pid in to_increment_stale:
+            existing = existing_products.get(pid, {})
+            current_stale_count = existing.get('stale_count', 0)
+            new_stale_count = current_stale_count + 1
+            
+            if new_stale_count >= 2:
+                # Stale for 2 consecutive runs - delete
+                to_delete_ids.append(pid)
+            else:
+                # Increment stale count (will be updated in DB)
+                pass
+
+        logger.info(f"Smart sync: {len(new_products)} new, {len(updated_products)} updated, {len(unchanged_product_ids)} unchanged, {len(to_delete_ids)} to delete")
+
+        # 5. Process new products (with embeddings)
+        logger.info(f"Processing {len(new_products)} new products...")
+        for i, product in enumerate(new_products):
+            if i > 0 and i % 10 == 0:
+                logger.info(f"Processing new products: {i}/{len(new_products)}")
+            
+            # Add last_seen_at
+            product['last_seen_at'] = now
+            product['stale_count'] = 0
+            
+            # Generate embeddings for new products
+            success = self._save_product_with_embeddings(product)
+            if success:
+                stats["new"] += 1
+            else:
+                failed_products_log.append({"product": product.get('title', 'unknown'), "reason": "embedding failed"})
+            time.sleep(0.5)  # Staggered embedding generation
+
+        # 6. Process updated products (with embeddings only if image changed)
+        logger.info(f"Processing {len(updated_products)} updated products...")
+        for i, product in enumerate(updated_products):
+            if i > 0 and i % 10 == 0:
+                logger.info(f"Processing updated products: {i}/{len(updated_products)}")
+            
+            product_id = self._compute_product_id(product)
+            existing = existing_products.get(product_id, {})
+            
+            # Add last_seen_at and reset stale_count
+            product['last_seen_at'] = now
+            product['stale_count'] = 0
+            
+            # Check if image changed - only regenerate embeddings if so
+            image_changed = product.get('image_url') != existing.get('image_url')
+            
+            if image_changed:
+                logger.debug(f"Image changed for {product.get('title')} - regenerating embeddings")
+                success = self._save_product_with_embeddings(product)
+            else:
+                # Copy existing embeddings to avoid regenerating
+                product['image_embedding'] = existing.get('image_embedding')
+                product['info_embedding'] = existing.get('info_embedding')
+                success = self._save_product_with_embeddings(product)
+            
+            if success:
+                stats["updated"] += 1
+            else:
+                failed_products_log.append({"product": product.get('title', 'unknown'), "reason": "update failed"})
+            time.sleep(0.5)  # Staggered embedding generation
+
+        # 7. Update stale products (increment stale_count, reset last_seen_at)
+        products_to_mark_stale = []
+        for pid in to_increment_stale:
+            if pid not in to_delete_ids:
+                existing = existing_products.get(pid, {})
+                products_to_mark_stale.append({
+                    'id': pid,
+                    'last_seen_at': now,
+                    'stale_count': (existing.get('stale_count', 0)) + 1,
+                    'source': self.source,
+                })
+        
+        if products_to_mark_stale:
+            # Batch update stale products
+            success, _, failed = self.supabase.batch_upsert_products(products_to_mark_stale)
+            if failed:
+                logger.warning(f"Failed to update {len(failed)} stale product counts")
+
+        # 8. Delete products that have been stale for 2 consecutive runs
         if to_delete_ids:
             if self.supabase.delete_products_by_ids(to_delete_ids):
-                logger.info(f"Deleted {len(to_delete_ids)} products no longer in catalog")
+                stats["deleted"] = len(to_delete_ids)
+                logger.info(f"Deleted {len(to_delete_ids)} stale products")
             else:
                 logger.error("Failed to delete stale products")
 
-        logger.info(f"Smart sync complete: {inserted} new products inserted, {len(to_delete_ids)} removed")
+        # 9. Log failed products to file
+        if failed_products_log:
+            self._log_failed_products(failed_products_log)
+
+        # 10. Print summary
+        self._print_summary(stats)
+        logger.info(f"Smart sync complete")
+
+    def _save_product_with_embeddings(self, product_data: dict) -> bool:
+        """Save product data to Supabase with embeddings, only generating embeddings when needed."""
+        try:
+            if not product_data.get('image_url'):
+                logger.error(f"No image URL for product: {product_data.get('title')} - cannot generate embedding")
+                return False
+
+            # Check if embeddings already exist (for unchanged/updated products)
+            has_image_emb = product_data.get('image_embedding') is not None
+            has_info_emb = product_data.get('info_embedding') is not None
+
+            # Generate image embedding if not present
+            if not has_image_emb:
+                logger.debug(f"Generating image embedding for: {product_data.get('title')}")
+                image_emb = self.generate_image_embedding(product_data['image_url'])
+                if not image_emb:
+                    logger.error(f"Could not generate image embedding for product: {product_data.get('title')}")
+                    return False
+                product_data['image_embedding'] = image_emb
+
+            # Generate info embedding if not present
+            if not has_info_emb:
+                info_parts = [
+                    product_data.get('title') or '',
+                    product_data.get('price') or '',
+                    product_data.get('description') or '',
+                    product_data.get('category') or '',
+                    product_data.get('gender') or '',
+                ]
+                if product_data.get('metadata'):
+                    info_parts.append(product_data['metadata'] if isinstance(product_data['metadata'], str) else json.dumps(product_data['metadata']))
+                info_text = " ".join(p for p in info_parts if p).strip()
+                if info_text:
+                    info_emb = self.generate_text_embedding(info_text)
+                    if info_emb:
+                        product_data['info_embedding'] = info_emb
+
+            success, failed_count, failed = self.supabase.batch_upsert_products([product_data])
+            if success:
+                logger.debug(f"Successfully saved product: {product_data.get('title')}")
+                return True
+            else:
+                logger.error(f"Failed to save product to database: {product_data.get('title')}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error saving product to Supabase: {e}")
+            return False
+
+    def _log_failed_products(self, failed_products: List[Dict[str, Any]]):
+        """Log failed products to a local file."""
+        try:
+            log_file = "failed_products.log"
+            timestamp = datetime.now(timezone.utc).isoformat()
+            with open(log_file, 'a') as f:
+                f.write(f"\n--- Failed products at {timestamp} ---\n")
+                for fp in failed_products:
+                    f.write(f"Product: {fp.get('product')}, Reason: {fp.get('reason')}\n")
+            logger.info(f"Logged {len(failed_products)} failed products to {log_file}")
+        except Exception as e:
+            logger.error(f"Failed to log failed products: {e}")
+
+    def _print_summary(self, stats: Dict[str, int]):
+        """Print the run summary."""
+        logger.info("=" * 50)
+        logger.info("SCRAPER RUN SUMMARY")
+        logger.info("=" * 50)
+        logger.info(f"  {stats['new']} new products added")
+        logger.info(f"  {stats['updated']} products updated")
+        logger.info(f"  {stats['unchanged']} products unchanged (skipped)")
+        logger.info(f"  {stats['deleted']} stale products deleted")
+        logger.info("=" * 50)
 
     def run(self):
         """Main execution method"""
